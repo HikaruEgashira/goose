@@ -71,6 +71,7 @@ pub struct ModelConfig {
     pub context_limit: Option<usize>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<i32>,
+    pub verbosity: Option<i32>,
     pub toolshim: bool,
     pub toolshim_model: Option<String>,
     pub fast_model: Option<String>,
@@ -93,6 +94,7 @@ impl ModelConfig {
     ) -> Result<Self, ConfigError> {
         let context_limit = Self::parse_context_limit(&model_name, None, context_env_var)?;
         let temperature = Self::parse_temperature()?;
+        let verbosity = Self::parse_verbosity()?;
         let toolshim = Self::parse_toolshim()?;
         let toolshim_model = Self::parse_toolshim_model()?;
 
@@ -101,6 +103,7 @@ impl ModelConfig {
             context_limit,
             temperature,
             max_tokens: None,
+            verbosity,
             toolshim,
             toolshim_model,
             fast_model: None,
@@ -181,6 +184,27 @@ impl ModelConfig {
         }
     }
 
+    fn parse_verbosity() -> Result<Option<i32>, ConfigError> {
+        if let Ok(val) = std::env::var("GOOSE_VERBOSITY") {
+            let verbosity = val.parse::<i32>().map_err(|_| {
+                ConfigError::InvalidValue(
+                    "GOOSE_VERBOSITY".to_string(),
+                    val.clone(),
+                    "must be a valid integer".to_string(),
+                )
+            })?;
+            if !(0..=2).contains(&verbosity) {
+                return Err(ConfigError::InvalidRange(
+                    "GOOSE_VERBOSITY".to_string(),
+                    "must be between 0 and 2".to_string(),
+                ));
+            }
+            Ok(Some(verbosity))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn parse_toolshim() -> Result<bool, ConfigError> {
         if let Ok(val) = std::env::var("GOOSE_TOOLSHIM") {
             match val.to_lowercase().as_str() {
@@ -240,6 +264,11 @@ impl ModelConfig {
 
     pub fn with_max_tokens(mut self, tokens: Option<i32>) -> Self {
         self.max_tokens = tokens;
+        self
+    }
+
+    pub fn with_verbosity(mut self, verbosity: Option<i32>) -> Self {
+        self.verbosity = verbosity;
         self
     }
 
@@ -402,16 +431,54 @@ mod tests {
         // Test with environment variables set
         with_var("GOOSE_CONTEXT_LIMIT", Some("50000"), || {
             with_var("GOOSE_TEMPERATURE", Some("0.7"), || {
-                with_var("GOOSE_TOOLSHIM", Some("true"), || {
-                    with_var("GOOSE_TOOLSHIM_OLLAMA_MODEL", Some("llama3"), || {
-                        let config = ModelConfig::new("test-model").unwrap();
-                        assert_eq!(config.context_limit(), 50_000);
-                        assert_eq!(config.temperature, Some(0.7));
-                        assert!(config.toolshim);
-                        assert_eq!(config.toolshim_model, Some("llama3".to_string()));
+                with_var("GOOSE_VERBOSITY", Some("1"), || {
+                    with_var("GOOSE_TOOLSHIM", Some("true"), || {
+                        with_var("GOOSE_TOOLSHIM_OLLAMA_MODEL", Some("llama3"), || {
+                            let config = ModelConfig::new("test-model").unwrap();
+                            assert_eq!(config.context_limit(), 50_000);
+                            assert_eq!(config.temperature, Some(0.7));
+                            assert_eq!(config.verbosity, Some(1));
+                            assert!(config.toolshim);
+                            assert_eq!(config.toolshim_model, Some("llama3".to_string()));
+                        });
                     });
                 });
             });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_invalid_verbosity() {
+        // Test invalid verbosity values
+        with_var("GOOSE_VERBOSITY", Some("abc"), || {
+            let result = ModelConfig::new("test-model");
+            assert!(result.is_err());
+            if let Err(ConfigError::InvalidValue(var, val, msg)) = result {
+                assert_eq!(var, "GOOSE_VERBOSITY");
+                assert_eq!(val, "abc");
+                assert!(msg.contains("valid integer"));
+            }
+        });
+
+        // Test verbosity out of range (negative)
+        with_var("GOOSE_VERBOSITY", Some("-1"), || {
+            let result = ModelConfig::new("test-model");
+            assert!(result.is_err());
+            assert!(matches!(
+                result.unwrap_err(),
+                ConfigError::InvalidRange(_, _)
+            ));
+        });
+
+        // Test verbosity out of range (too high)
+        with_var("GOOSE_VERBOSITY", Some("3"), || {
+            let result = ModelConfig::new("test-model");
+            assert!(result.is_err());
+            assert!(matches!(
+                result.unwrap_err(),
+                ConfigError::InvalidRange(_, _)
+            ));
         });
     }
 }

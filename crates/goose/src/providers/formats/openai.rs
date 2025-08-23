@@ -571,7 +571,8 @@ pub fn create_request(
     tools: &[Tool],
     image_format: &ImageFormat,
 ) -> anyhow::Result<Value, Error> {
-    if model_config.model_name.starts_with("o1-mini") {
+    let parts: Vec<&str> = model_config.model_name.split('-').collect();
+    if parts.len() >= 2 && parts[0] == "o1" && parts[1] == "mini" {
         return Err(anyhow!(
             "o1-mini model is not currently supported since Goose uses tool calling and o1-mini does not support it. Please use o1 or o3 models instead."
         ));
@@ -579,24 +580,61 @@ pub fn create_request(
 
     let is_ox_model =
         model_config.model_name.starts_with("o") || model_config.model_name.starts_with("gpt-5");
+    let is_gpt5_model = model_config.model_name.starts_with("gpt-5");
 
-    // Only extract reasoning effort for O1/O3 models
     let (model_name, reasoning_effort) = if is_ox_model {
-        let parts: Vec<&str> = model_config.model_name.split('-').collect();
-        let last_part = parts.last().unwrap();
+        if is_gpt5_model {
+            let model_size_variants = ["mini", "nano"];
+            let reasoning_efforts = ["minimal", "low", "medium", "high"];
 
-        match *last_part {
-            "low" | "medium" | "high" => {
-                let base_name = parts[..parts.len() - 1].join("-");
-                (base_name, Some(last_part.to_string()))
+            let has_size_variant = parts.len() >= 3 && model_size_variants.contains(&parts[2]);
+
+            if has_size_variant {
+                if parts.len() == 3 {
+                    (model_config.model_name.clone(), Some("medium".to_string()))
+                } else if parts.len() == 4 && reasoning_efforts.contains(&parts[3]) {
+                    let base_model = parts[..3].join("-");
+                    let reasoning = if parts[3] == "minimal" {
+                        "minimal".to_string()
+                    } else {
+                        parts[3].to_string()
+                    };
+                    (base_model, Some(reasoning))
+                } else {
+                    (model_config.model_name.clone(), Some("medium".to_string()))
+                }
+            } else {
+                let last_part = parts.last().unwrap();
+                match *last_part {
+                    "minimal" => {
+                        let base_name = parts[..parts.len() - 1].join("-");
+                        (base_name, Some("minimal".to_string()))
+                    }
+                    "low" | "medium" | "high" => {
+                        let base_name = parts[..parts.len() - 1].join("-");
+                        (base_name, Some(last_part.to_string()))
+                    }
+                    _ => (model_config.model_name.clone(), Some("medium".to_string())),
+                }
             }
-            _ => (
-                model_config.model_name.to_string(),
-                Some("medium".to_string()),
-            ),
+        } else {
+            let last_part = parts.last().unwrap();
+            match *last_part {
+                "minimal" => {
+                    let base_name = parts[..parts.len() - 1].join("-");
+                    (base_name, Some("medium".to_string()))
+                }
+                "low" | "medium" | "high" => {
+                    let base_name = parts[..parts.len() - 1].join("-");
+                    (base_name, Some(last_part.to_string()))
+                }
+                _ => (
+                    model_config.model_name.to_string(),
+                    Some("medium".to_string()),
+                ),
+            }
         }
     } else {
-        // For non-O family models, use the model name as is and no reasoning effort
         (model_config.model_name.to_string(), None)
     };
 
@@ -658,6 +696,16 @@ pub fn create_request(
             .unwrap()
             .insert(key.to_string(), json!(tokens));
     }
+
+    if is_gpt5_model {
+        if let Some(verbosity) = model_config.verbosity {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("verbosity".to_string(), json!(verbosity));
+        }
+    }
+
     Ok(payload)
 }
 
@@ -1075,6 +1123,7 @@ mod tests {
             context_limit: Some(4096),
             temperature: None,
             max_tokens: Some(1024),
+            verbosity: None,
             toolshim: false,
             toolshim_model: None,
             fast_model: None,
@@ -1107,6 +1156,7 @@ mod tests {
             context_limit: Some(4096),
             temperature: None,
             max_tokens: Some(1024),
+            verbosity: None,
             toolshim: false,
             toolshim_model: None,
             fast_model: None,
@@ -1140,6 +1190,7 @@ mod tests {
             context_limit: Some(4096),
             temperature: None,
             max_tokens: Some(1024),
+            verbosity: None,
             toolshim: false,
             toolshim_model: None,
             fast_model: None,
@@ -1161,6 +1212,191 @@ mod tests {
         for (key, value) in expected.as_object().unwrap() {
             assert_eq!(obj.get(key).unwrap(), value);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_gpt5_minimal_reasoning_effort() -> anyhow::Result<()> {
+        // Test minimal reasoning effort for GPT-5 model
+        let model_config = ModelConfig {
+            model_name: "gpt-5-minimal".to_string(),
+            context_limit: Some(4096),
+            temperature: None,
+            max_tokens: Some(1024),
+            verbosity: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+        };
+        let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
+        let obj = request.as_object().unwrap();
+        let expected = json!({
+            "model": "gpt-5",
+            "messages": [
+                {
+                    "role": "developer",
+                    "content": "system"
+                }
+            ],
+            "reasoning_effort": "minimal",
+            "max_completion_tokens": 1024
+        });
+
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(obj.get(key).unwrap(), value);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_o1_minimal_fallback() -> anyhow::Result<()> {
+        // Test that o1 model with minimal effort falls back to low
+        let model_config = ModelConfig {
+            model_name: "o1-minimal".to_string(),
+            context_limit: Some(4096),
+            temperature: None,
+            max_tokens: Some(1024),
+            verbosity: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+        };
+        let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
+        let obj = request.as_object().unwrap();
+
+        // Should fallback to "medium" since o1 doesn't support minimal
+        assert_eq!(obj.get("model").unwrap(), "o1");
+        assert_eq!(obj.get("reasoning_effort").unwrap(), "medium");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_gpt5_with_verbosity() -> anyhow::Result<()> {
+        // Test GPT-5 model with verbosity parameter
+        let model_config = ModelConfig {
+            model_name: "gpt-5".to_string(),
+            context_limit: Some(4096),
+            temperature: None,
+            max_tokens: Some(1024),
+            verbosity: Some(1),
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+        };
+        let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
+        let obj = request.as_object().unwrap();
+        let expected = json!({
+            "model": "gpt-5",
+            "messages": [
+                {
+                    "role": "developer",
+                    "content": "system"
+                }
+            ],
+            "reasoning_effort": "medium",
+            "verbosity": 1,
+            "max_completion_tokens": 1024
+        });
+
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(obj.get(key).unwrap(), value);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_gpt5_without_verbosity() -> anyhow::Result<()> {
+        // Test GPT-5 model without verbosity parameter
+        let model_config = ModelConfig {
+            model_name: "gpt-5".to_string(),
+            context_limit: Some(4096),
+            temperature: None,
+            max_tokens: Some(1024),
+            verbosity: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+        };
+        let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
+        let obj = request.as_object().unwrap();
+
+        // Should not include verbosity if not set
+        assert!(obj.get("verbosity").is_none());
+        assert_eq!(obj.get("model").unwrap(), "gpt-5");
+        assert_eq!(obj.get("reasoning_effort").unwrap(), "medium");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_gpt5_mini() -> anyhow::Result<()> {
+        // Test GPT-5 mini model without reasoning effort
+        let model_config = ModelConfig {
+            model_name: "gpt-5-mini".to_string(),
+            context_limit: Some(4096),
+            temperature: None,
+            max_tokens: Some(1024),
+            verbosity: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+        };
+        let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
+        let obj = request.as_object().unwrap();
+
+        assert_eq!(obj.get("model").unwrap(), "gpt-5-mini");
+        assert_eq!(obj.get("reasoning_effort").unwrap(), "medium");
+        assert!(obj.get("verbosity").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_gpt5_nano_with_reasoning() -> anyhow::Result<()> {
+        // Test GPT-5 nano model with low reasoning effort
+        let model_config = ModelConfig {
+            model_name: "gpt-5-nano-low".to_string(),
+            context_limit: Some(4096),
+            temperature: None,
+            max_tokens: Some(1024),
+            verbosity: Some(2),
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+        };
+        let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
+        let obj = request.as_object().unwrap();
+
+        assert_eq!(obj.get("model").unwrap(), "gpt-5-nano");
+        assert_eq!(obj.get("reasoning_effort").unwrap(), "low");
+        assert_eq!(obj.get("verbosity").unwrap(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_gpt5_mini_minimal_reasoning() -> anyhow::Result<()> {
+        // Test GPT-5 mini model with minimal reasoning effort
+        let model_config = ModelConfig {
+            model_name: "gpt-5-mini-minimal".to_string(),
+            context_limit: Some(4096),
+            temperature: None,
+            max_tokens: Some(1024),
+            verbosity: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model: None,
+        };
+        let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
+        let obj = request.as_object().unwrap();
+
+        assert_eq!(obj.get("model").unwrap(), "gpt-5-mini");
+        assert_eq!(obj.get("reasoning_effort").unwrap(), "minimal");
+        assert!(obj.get("verbosity").is_none());
 
         Ok(())
     }
