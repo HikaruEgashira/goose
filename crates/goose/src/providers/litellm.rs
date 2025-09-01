@@ -218,7 +218,7 @@ impl Provider for LiteLLMProvider {
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch models from LiteLLM: {}", e);
-                Ok(None)
+                Err(e)
             }
         }
     }
